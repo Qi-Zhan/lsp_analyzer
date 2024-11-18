@@ -18,10 +18,12 @@ class WorkSpace:
             self.tree_map[path] = self.parser.parse(content)
 
     def __getitem__(self, key: str) -> tree_sitter.Tree:
+        key = Path(key).name
         absolute_path = self.root/key
         return self.tree_map[absolute_path]
 
     def __setitem__(self, key: str, value: tree_sitter.Node):
+        key = Path(key).name
         absolute_path = self.root/key
         self.tree_map[absolute_path] = value
 
@@ -38,7 +40,7 @@ class LanguageServerAnalyzer:
     def get_file_tree(self, file: str) -> tree_sitter.Tree:
         return self.workspace[file]
 
-    def request_definition_by_line(self, file: str, line: int, column: int) -> tree_sitter.Node | None:
+    def request_definition_by_line(self, file: str, line: int, column: int) -> tuple[str, tree_sitter.Node] | None:
         with self.lsp.start_server():
             lsp_results = self.lsp.request_definition(file, line, column)
         if lsp_results is None:
@@ -46,37 +48,40 @@ class LanguageServerAnalyzer:
         query = self.tree_sitter_language.query(
             """(identifier)@element"""
         )
-        captures = query.captures(self.workspace[file].root_node)
-        all_identifiers = captures["element"]
         for lsp_result in lsp_results:
             lsp_range = lsp_result['range']
-            first = next(filter(lambda ident: pos_eq(
-                lsp_range, ident.range), all_identifiers))
-            return first
+            relative_path = lsp_result["relativePath"]
+            file_node = self.workspace[relative_path].root_node
+            captures = query.captures(file_node)
+            all_identifiers = captures["element"]
+            first = filter(lambda ident: pos_eq(
+                lsp_range, ident.range), all_identifiers)
+            if len(all_identifiers) > 0:
+                if first := next(first, None):
+                    return relative_path, first
+                # if [0, 0] -> [0, 1], it means the file itself is the definition
+                if pos_eq(lsp_range, tree_sitter.Range((0, 0), (0, 1), 0, 1)):
+                    return relative_path, file_node
         else:
-            raise Exception(f"no definition in {file}:[{line}:{column}]")
+            return None
 
-    def request_definition(self, file: str, node: tree_sitter.Node) -> tree_sitter.Node | None:
+    def request_definition(self, file: str, node: tree_sitter.Node) -> tuple[str, tree_sitter.Node] | None:
         start_point = node.range.start_point
         line, column = start_point.row, start_point.column
         return self.request_definition_by_line(file, line, column)
 
-    def request_rename(self, file: str, node: tree_sitter.Node, new_name: str) -> bool:
-        start_point = node.range.start_point
-        line, column = start_point.row, start_point.column
+    def request_rename_by_line(self, file: str, line: int, column: int, new_name: str) -> bool:
         with self.lsp.start_server():
-            lsp_results = self.lsp.request_rename(
-                file, line, column, new_name
-            )
+            lsp_results = self.lsp.request_rename(file, line, column, new_name)
         if lsp_results is None:
             return False
         document_changes = lsp_results["documentChanges"]
-        new_lines = self.get_file_tree(
-            file).root_node.text.decode().splitlines()
 
         for change in document_changes:
             assert "textDocument" in change
             url = change["textDocument"]["uri"]
+            new_lines = self.get_file_tree(
+                url).root_node.text.decode().splitlines()
             edits = change["edits"]
             for edit in edits:
                 range_ = edit["range"]
@@ -86,10 +91,14 @@ class LanguageServerAnalyzer:
                 new_text = edit["newText"]
                 new_lines[line] = new_lines[line][0:start["character"]] + \
                     new_text + new_lines[line][end["character"]:]
-
-        self.workspace[file] = self.workspace.parser.parse(
-            '\n'.join(new_lines).encode())
+            self.workspace[url] = self.workspace.parser.parse(
+                '\n'.join(new_lines).encode())
         return True
+
+    def request_rename(self, file: str, node: tree_sitter.Node, new_name: str) -> bool:
+        start_point = node.range.start_point
+        line, column = start_point.row, start_point.column
+        return self.request_rename_by_line(file, line, column, new_name)
 
     def text(self, file: str) -> str:
         return self.workspace[file].root_node.text.decode()
@@ -100,19 +109,25 @@ def pos_eq(lsp_range: multispy_types.Range, tree_range: tree_sitter.Range) -> bo
 
 
 repo_path = Path(__file__).parent/"test"
-file_name = "a.py"
+file_name = "b.py"
 analyzer = LanguageServerAnalyzer(Language.PYTHON, str(repo_path))
+
 root_node = analyzer.get_file_tree(file_name).root_node
 print(root_node.text.decode())
+# REQUEST DEFINITION EXAMPLE
 query = Language.PYTHON.tree_sitter().query(
     """(identifier)@element"""
 )
 captures = query.captures(root_node)
 elements = captures["element"]
 for element in elements:
-    definition = analyzer.request_definition(file_name, element)
-    print(f"{element.range} -> {definition.range}")
-
+    def_file, def_node = analyzer.request_definition(file_name, element)
+    # print file, line, column -> definition file, line, column
+    print(f"{file_name}, [{element.range.start_point.row}, {element.range.start_point.column}] -> {def_file}, [{def_node.range.start_point.row}, {def_node.range.start_point.column}]")
+# RENAME EXAMPLE
 a = elements[-1]
 assert analyzer.request_rename(file_name, a, "bb")
+print('After rename:')
 print(analyzer.text(file_name))
+print('#'*10)
+print(analyzer.text("a.py"))
