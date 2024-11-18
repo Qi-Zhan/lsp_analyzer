@@ -99,9 +99,10 @@ def pos_eq(lsp_range: multispy_types.Range, tree_range: tree_sitter.Range) -> bo
     return lsp_range["start"]["line"] == tree_range.start_point.row and lsp_range["end"]["line"] == tree_range.end_point.row and lsp_range["start"]["character"] == tree_range.start_point.column and lsp_range["end"]["character"] == tree_range.end_point.column
 
 
-analyzer = LanguageServerAnalyzer(
-    Language.PYTHON, "/Users/zhanqi/project/icloud/lsp_analyzer/test")
-root_node = analyzer.get_file_tree("a.py").root_node
+repo_path = Path(__file__).parent/"test"
+file_name = "a.py"
+analyzer = LanguageServerAnalyzer(Language.PYTHON, str(repo_path))
+root_node = analyzer.get_file_tree(file_name).root_node
 print(root_node.text.decode())
 query = Language.PYTHON.tree_sitter().query(
     """(identifier)@element"""
@@ -109,9 +110,9 @@ query = Language.PYTHON.tree_sitter().query(
 captures = query.captures(root_node)
 elements = captures["element"]
 for element in elements:
-    definition = analyzer.request_definition("a.py", element)
+    definition = analyzer.request_definition(file_name, element)
     print(f"{element.range} -> {definition.range}")
 
 a = elements[-1]
-assert analyzer.request_rename("a.py", a, "bb")
-print(analyzer.text("a.py"))
+assert analyzer.request_rename(file_name, a, "bb")
+print(analyzer.text(file_name))
