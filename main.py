@@ -6,6 +6,8 @@ from multilspy.multilspy_config import Language
 import multilspy.multilspy_types as multispy_types
 
 from pathlib import Path
+from contextlib import contextmanager
+from multilspy.multilspy_utils import PathUtils
 
 
 class WorkSpace:
@@ -16,16 +18,19 @@ class WorkSpace:
         for path in self.root.rglob(f'*{language.extension()}'):
             content = path.read_bytes()
             self.tree_map[path] = self.parser.parse(content)
-
-    def __getitem__(self, key: str) -> tree_sitter.Tree:
-        key = Path(key).name
-        absolute_path = self.root/key
-        return self.tree_map[absolute_path]
-
-    def __setitem__(self, key: str, value: tree_sitter.Node):
-        key = Path(key).name
-        absolute_path = self.root/key
-        self.tree_map[absolute_path] = value
+    
+    def get_by_relative_path(self, relative_path: str) -> tree_sitter.Tree:
+        return self.tree_map[self.root/relative_path]
+    
+    def set_by_relative_path(self, relative_path: str, value: tree_sitter.Node):
+        self.tree_map[self.root/relative_path] = value
+    
+    def get_by_url(self, url: str) -> tree_sitter.Tree:
+        return self.tree_map[Path(PathUtils.uri_to_path(url))]
+    
+    def set_by_url(self, url: str, value: tree_sitter.Node):
+        self.tree_map[Path(PathUtils.uri_to_path(url))] = value
+    
 
 
 class LanguageServerAnalyzer:
@@ -37,12 +42,18 @@ class LanguageServerAnalyzer:
             config, logger, repository_root_path)
         self.workspace = WorkSpace(language, repository_root_path)
 
-    def get_file_tree(self, file: str) -> tree_sitter.Tree:
-        return self.workspace[file]
+    def get_ast(self, relative_path: str) -> tree_sitter.Tree:
+        return self.workspace.get_by_relative_path(relative_path)
 
+    @contextmanager
+    def start_server(self):
+        self.lsp.start_server().__enter__()
+        try:
+            yield
+        finally: ...
+    
     def request_definition_by_line(self, file: str, line: int, column: int) -> tuple[str, tree_sitter.Node] | None:
-        with self.lsp.start_server():
-            lsp_results = self.lsp.request_definition(file, line, column)
+        lsp_results = self.lsp.request_definition(file, line, column)
         if lsp_results is None:
             return None
         query = self.tree_sitter_language.query(
@@ -51,7 +62,7 @@ class LanguageServerAnalyzer:
         for lsp_result in lsp_results:
             lsp_range = lsp_result['range']
             relative_path = lsp_result["relativePath"]
-            file_node = self.workspace[relative_path].root_node
+            file_node = self.workspace.get_by_relative_path(relative_path).root_node
             captures = query.captures(file_node)
             all_identifiers = captures["element"]
             first = filter(lambda ident: pos_eq(
@@ -71,8 +82,7 @@ class LanguageServerAnalyzer:
         return self.request_definition_by_line(file, line, column)
 
     def request_rename_by_line(self, file: str, line: int, column: int, new_name: str) -> bool:
-        with self.lsp.start_server():
-            lsp_results = self.lsp.request_rename(file, line, column, new_name)
+        lsp_results = self.lsp.request_rename(file, line, column, new_name)
         if lsp_results is None:
             return False
         document_changes = lsp_results["documentChanges"]
@@ -80,7 +90,7 @@ class LanguageServerAnalyzer:
         for change in document_changes:
             assert "textDocument" in change
             url = change["textDocument"]["uri"]
-            new_lines = self.get_file_tree(
+            new_lines = self.workspace.get_by_url(
                 url).root_node.text.decode().splitlines()
             edits = change["edits"]
             for edit in edits:
@@ -91,8 +101,8 @@ class LanguageServerAnalyzer:
                 new_text = edit["newText"]
                 new_lines[line] = new_lines[line][0:start["character"]] + \
                     new_text + new_lines[line][end["character"]:]
-            self.workspace[url] = self.workspace.parser.parse(
-                '\n'.join(new_lines).encode())
+            self.workspace.set_by_url(url, self.workspace.parser.parse(
+                '\n'.join(new_lines).encode()))
         return True
 
     def request_rename(self, file: str, node: tree_sitter.Node, new_name: str) -> bool:
@@ -100,8 +110,8 @@ class LanguageServerAnalyzer:
         line, column = start_point.row, start_point.column
         return self.request_rename_by_line(file, line, column, new_name)
 
-    def text(self, file: str) -> str:
-        return self.workspace[file].root_node.text.decode()
+    def get_text(self, relative_path: str) -> str:
+        return self.workspace.get_by_relative_path(relative_path).root_node.text.decode()
 
 
 def pos_eq(lsp_range: multispy_types.Range, tree_range: tree_sitter.Range) -> bool:
@@ -112,22 +122,25 @@ repo_path = Path(__file__).parent/"test"
 file_name = "b.py"
 analyzer = LanguageServerAnalyzer(Language.PYTHON, str(repo_path))
 
-root_node = analyzer.get_file_tree(file_name).root_node
-print(root_node.text.decode())
 # REQUEST DEFINITION EXAMPLE
-query = Language.PYTHON.tree_sitter().query(
-    """(identifier)@element"""
-)
-captures = query.captures(root_node)
-elements = captures["element"]
-for element in elements:
-    def_file, def_node = analyzer.request_definition(file_name, element)
-    # print file, line, column -> definition file, line, column
-    print(f"{file_name}, [{element.range.start_point.row}, {element.range.start_point.column}] -> {def_file}, [{def_node.range.start_point.row}, {def_node.range.start_point.column}]")
+with analyzer.start_server():
+    root_node = analyzer.get_ast(file_name).root_node
+    print(root_node.text.decode())
+    query = Language.PYTHON.tree_sitter().query(
+        """(identifier)@element"""
+    )
+    captures = query.captures(root_node)
+    elements = captures["element"]
+    for element in elements:
+        def_file, def_node = analyzer.request_definition(file_name, element)
+        # print file, line, column -> definition file, line, column
+        print(f"{file_name}, [{element.range.start_point.row}, {element.range.start_point.column}] -> {def_file}, [{def_node.range.start_point.row}, {def_node.range.start_point.column}]")
+
 # RENAME EXAMPLE
-a = elements[-1]
-assert analyzer.request_rename(file_name, a, "bb")
-print('After rename:')
-print(analyzer.text(file_name))
-print('#'*10)
-print(analyzer.text("a.py"))
+with analyzer.start_server():
+    a = elements[-1]
+    assert analyzer.request_rename(file_name, a, "bb")
+    print('After rename:')
+    print(analyzer.get_text(file_name))
+    print('#'*10)
+    print(analyzer.get_text("a.py"))
